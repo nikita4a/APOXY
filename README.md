@@ -1,7 +1,5 @@
 # MINOXY ⚡
 
-[![Go Version](https://img.shields.io/github/go-mod/go-version/username/repo?color=blue)](https://go.dev/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 **MINOXY** — это высокопроизводительный, асинхронный и интерактивный чекер и скрапер прокси-серверов на языке Go. Приложение предоставляет красивый консольный интерфейс (TUI) на базе библиотек Bubble Tea и Lip Gloss, позволяющий в реальном времени отслеживать процесс парсинга и валидации прокси.
 
