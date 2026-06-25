@@ -34,7 +34,7 @@
 
 1. Склонируйте репозиторий с проектом:
    ```bash
-   git clone https://github.com/your-username/minoxy.git
+   git clone https://github.com/OGRYZOK-dev/MINOXY.git
    cd minoxy
    ```
 
