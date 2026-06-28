@@ -1,83 +1,131 @@
-<img width="551" height="189" alt="image" src="https://github.com/user-attachments/assets/1b553b54-84e9-4834-a560-236d8da1ed4b" />
+# APOXY — API Proxy Scanner
 
-**MINOXY** — это высокопроизводительный, асинхронный и интерактивный чекер и скрапер прокси-серверов на языке Go. Приложение предоставляет красивый консольный интерфейс (TUI) на базе библиотек Bubble Tea и Lip Gloss, позволяющий в реальном времени отслеживать процесс парсинга и валидации прокси.
+Fork of [MINOXY](https://github.com/OGRYZOK-dev/MINOXY) — repurposed for finding and validating OpenAI-compatible API endpoints.
 
----
+## Features
 
-## ✨ Ключевые особенности
+- Scrapes GitHub repos, pastebins, and URL lists for `/v1` API endpoints
+- Validates `/v1/models` and `/v1/chat/completions`
+- **Unlimited check** — tests if endpoint accepts requests without billing (sends request with invalid key, expects 401)
+- **Rate limit detection** — burst-tests endpoint to detect 429 thresholds
+- Export: JSON (machine-readable) + Hermes `custom_providers` YAML
+- Beautiful TUI with Bubble Tea
 
-- ⚡ **Высокая производительность**: Многопоточная проверка прокси через пулы горутин (worker pool) с гибко настраиваемым количеством потоков.
-- 🎨 **Современный TUI интерфейс**: Интерактивный терминальный интерфейс с поддержкой цветных тем, отображением прогресс-баров и подробной статистики в реальном времени.
-- 🌐 **Мультипротокольность**: Поддержка проверки протоколов **HTTP**, **SOCKS4** и **SOCKS5**.
-- 📥 **Встроенный скрапер**: Автоматический сбор необработанных прокси из списка удаленных репозиториев (по умолчанию подключены проверенные публичные списки).
-- ⚙️ **Гибкая конфигурация**: Настройка через простой файл `config.yaml` (таймауты, потоки, URL для проверки, пути экспорта и т.д.).
-- 💾 **Экспорт результатов**: Сохранение живых прокси в текстовый файл с сортировкой по протоколам или в виде общего списка.
-- ⏸️ **Управление процессом**: Возможность приостановки (Pause), продолжения (Resume) и полной остановки проверки в любой момент.
+## Quick Start
 
----
-
-## 🛠️ Системные требования и установка
-
-Для компиляции и запуска вам понадобится установленный компилятор **Go** (рекомендуется версия 1.22+).
-
-1. Склонируйте репозиторий с проектом:
-   ```bash
-   git clone https://github.com/OGRYZOK-dev/MINOXY.git
-   cd minoxy
-   ```
-
-2. Загрузите необходимые зависимости:
-   ```bash
-   go mod tidy
-   ```
-
-3. Скомпилируйте проект:
-   ```bash
-   go build -o minoxy.exe main.go
-   ```
-
-4. Запустите исполняемый файл:
-   ```bash
-   ./minoxy.exe
-   ```
-
----
-
-## ⚙️ Конфигурация (`config.yaml`)
-
-При первом запуске программа автоматически сгенерирует файл конфигурации по умолчанию `config.yaml` в корневой папке. Пример файла конфигурации:
-
-```yaml
-threads: 500                           # Количество одновременно работающих потоков (workers)
-timeout: 6s                            # Тайм-аут ожидания ответа прокси
-check_url: http://ip2c.org/self        # URL-адрес, используемый для проверки работоспособности
-export_path: exports/live_proxies.txt  # Путь для сохранения проверенных (живых) прокси
-sources:                               # Список URL-адресов для парсинга прокси
-  - https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt
-  - https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt
-  - https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt
-  - https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt
-protocols:                             # Проверяемые протоколы
-  - http
-  - socks4
-  - socks5
+```bash
+git clone https://github.com/nikita4a/APOXY.git
+cd APOXY
+go mod tidy
+go build -o apoxy .
+./apoxy
 ```
 
----
+## Config (config.yaml)
 
-## 🎮 Управление в TUI
+```yaml
+threads: 200          # concurrent workers
+timeout: 8s           # per-endpoint timeout
+check_models: true    # fetch /v1/models
+export_path: exports/api_proxies.json
+sources:
+  - https://raw.githubusercontent.com/cheahjs/free-llm-api-resources/main/README.md
+  # add your own URL lists
+```
 
-Навигация и управление процессом проверки осуществляются с помощью клавиатуры:
+## Two Checks Explained
 
-### Главное меню:
-- `↑ / ↓` — Перемещение по пунктам меню
-- `Enter` — Подтверждение выбора (запустить чекер, показать/скрыть настройки)
-- `q` — Выход из программы
+### 1. Unlimited/Free Check (`Unlimited` field)
 
-### Во время проверки:
-- `Space` (Пробел) — Приостановить (Pause) / Продолжить (Resume) проверку
-- `Esc` — Остановить проверку и вернуться в меню (или перейти к окну экспорта)
+Sends a POST to `/v1/chat/completions` with an intentionally invalid API key (`Bearer INVALID_KEY_APOXY_UNLIMITED_CHECK`):
 
-### Окно экспорта:
-- `y` — Подтвердить сохранение живых прокси в файл
-- `n` — Отменить сохранение и вернуться в главное меню
+| Response | Meaning |
+|----------|---------|
+| **401 Unauthorized** | Endpoint is open — anyone with a valid key can use it. Marked as `unlimited: true` |
+| **403 Forbidden** | Might be gated but still accessible. Marked `unlimited: true` |
+| **429 Too Many Requests** | Rate-limited even without a valid key. `unlimited: false` |
+| **Other** | Endpoint is closed/restricted. `unlimited: false` |
+
+### 2. Rate Limit Detection (`rate_limit_rpm` field)
+
+Sends 10 rapid GET requests to `/v1/models` and counts 429 responses:
+
+| Result | Meaning |
+|--------|---------|
+| **0 hits** | No rate limit detected → `rate_limit_rpm: 999` |
+| **1-3 hits** | Low rate limit → use with caution |
+| **4-9 hits** | Aggressive rate limiting → not recommended for heavy use |
+| **10 hits** | Extremely limited → practically unusable |
+
+## Key Bindings
+
+| Key | Action |
+|-----|--------|
+| Up/Down | Navigate menu |
+| Enter | Start scan / Rescan |
+| Space | Pause/Resume during scan |
+| Esc | Stop scan |
+| Y | Export results as JSON |
+| H | Export as Hermes YAML config |
+| Q | Quit |
+
+## Export Formats
+
+### JSON (`exports/api_proxies.json`)
+```json
+{
+  "generated": "2026-06-28T12:00:00Z",
+  "alive_count": 15,
+  "total_models": 342,
+  "proxies": [
+    {
+      "url": "https://api.example.com/v1",
+      "alive": true,
+      "latency_ms": 45000000,
+      "models": ["model-a", "model-b"],
+      "models_count": 2,
+      "unlimited": true,
+      "rate_limit_rpm": 999
+    }
+  ]
+}
+```
+
+### Hermes YAML (`exports/hermes_providers.yaml`)
+```yaml
+custom_providers:
+  - name: apoxy-found-0
+    base_url: https://api.example.com/v1
+    provider: openai
+    api_key: ''
+    discover_models: false
+    models:
+      model-a:
+        ctx: 131072
+      model-b:
+        ctx: 131072
+```
+
+## Architecture
+
+```
+main.go              # Entry point
+config/config.go     # YAML config loader
+proxy/
+  apicheck.go        # /v1/models + /v1/chat validation + unlimited + rate limit
+  scraper.go         # URL extraction from markdown/text sources
+  runner.go          # Worker pool (configurable threads)
+  exporter.go        # JSON + Hermes YAML export
+tui/
+  tui.go             # Bubble Tea TUI
+  styles.go          # Lipgloss styles
+```
+
+## Credits
+
+- [MINOXY](https://github.com/OGRYZOK-dev/MINOXY) — original proxy checker that inspired this fork
+- [Bubble Tea](https://github.com/charmbracelet/bubbletea) — TUI framework
+
+## License
+
+MIT
