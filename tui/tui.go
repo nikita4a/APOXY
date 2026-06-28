@@ -1,444 +1,173 @@
 package tui
 
 import (
+	"apoxy/config"
+	"apoxy/proxy"
 	"context"
 	"fmt"
-	"minoxy/config"
-	"minoxy/proxy"
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/progress"
-	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
-type Screen int
-
-const (
-	ScreenWelcome Screen = iota
-	ScreenChecking
-	ScreenExport
-)
-
-type runnerClosedMsg struct{}
-type eventMsg proxy.RunnerEvent
-
-type Model struct {
-	screen     Screen
-	config     *config.Config
+type model struct {
+	cfg        *config.Config
 	configPath string
 	runner     *proxy.Runner
 	ctx        context.Context
-	cancelFunc context.CancelFunc
-
-	// Checking State
-	scrapedCount  int
-	checkedCount  int
-	liveCount     int
-	httpCount     int
-	socks4Count   int
-	socks5Count   int
-	avgPing       time.Duration
-	scrapingDone  bool
-	checkingDone  bool
-	currentSource string
-	recentLive    []*proxy.CheckedProxy
-	allLive       []*proxy.CheckedProxy
-	progressBar   progress.Model
-
-	// Welcome Screen Menu
-	welcomeIdx int // 0: Start, 1: Toggle Settings, 2: Exit
-
-	// Export Screen Form Navigation
-	exportIdx    int // 0: HTTP, 1: SOCKS4, 2: SOCKS5, 3: CC, 4: Ping, 5: Format, 6: Path, 7: ExportBtn, 8: BackBtn
-	focusedField int // 0: menu navigation, 3: CC editing, 4: Ping editing, 6: Path editing
-
-	// Filters & Form inputs
-	filterHTTP   bool
-	filterSocks4 bool
-	filterSocks5 bool
-	filterCC     textinput.Model // Country Code input
-	filterPing   textinput.Model // Max Ping input
-
-	// Export Path Input
-	exportPath   textinput.Model
-	exportFormat int // index of ["raw", "uri", "pretty", "csv", "json"]
-	exportMsg    string
-	exportErr    bool
-	showConfig   bool // Welcome screen toggle
-
-	width  int
-	height int
+	cancel     context.CancelFunc
+	state      state
+	menuCursor int
+	results    []*proxy.APIProxyResult
+	lastResult *proxy.APIProxyResult
+	scanned, alive, totalModels int
+	avgLatency time.Duration
+	errors     []string
+	logLines   []string
+	width, height int
 }
 
-func NewModel(cfg *config.Config, configPath string) Model {
-	pBar := progress.New(
-		progress.WithDefaultGradient(),
-		progress.WithoutPercentage(),
-	)
+type state int
+const ( stateMenu state = iota; stateScanning; stateDone )
 
-	filterCC := textinput.New()
-	filterCC.Placeholder = "All (e.g. US,GB)"
-	filterCC.Width = 25
-
-	filterPing := textinput.New()
-	filterPing.Placeholder = "No limit (e.g. 500ms)"
-	filterPing.Width = 25
-
-	exportPath := textinput.New()
-	exportPath.SetValue(cfg.ExportPath)
-	exportPath.Width = 30
-
-	return Model{
-		screen:       ScreenWelcome,
-		config:       cfg,
-		configPath:   configPath,
-		progressBar:  pBar,
-		filterHTTP:   true,
-		filterSocks4: true,
-		filterSocks5: true,
-		filterCC:     filterCC,
-		filterPing:   filterPing,
-		exportPath:   exportPath,
-		exportFormat: 2, // Default to "pretty"
-	}
+func NewModel(cfg *config.Config, configPath string) *model {
+	return &model{cfg: cfg, configPath: configPath, state: stateMenu}
 }
 
-func (m Model) Init() tea.Cmd {
-	return nil
-}
+func (m *model) Init() tea.Cmd { return nil }
 
-func listenForEvents(ch chan proxy.RunnerEvent) tea.Cmd {
-	return func() tea.Msg {
-		event, ok := <-ch
-		if !ok {
-			return runnerClosedMsg{}
-		}
-		return eventMsg(event)
-	}
-}
-
-func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		m.progressBar.Width = msg.Width - 10
-		if m.progressBar.Width > 60 {
-			m.progressBar.Width = 60
-		}
-		return m, nil
-
-	case runnerClosedMsg:
-		m.checkingDone = true
-		m.runner = nil
-		return m, nil
-
-	case eventMsg:
-		switch msg.Type {
-		case proxy.EventScrapingSource:
-			m.currentSource = msg.Payload.(string)
-		case proxy.EventScrapeError:
-			m.currentSource = msg.Payload.(string)
-		case proxy.EventSourceScraped:
-			// stats are calculated dynamically below
-		case proxy.EventScrapingDone:
-			m.scrapingDone = true
-			m.scrapedCount = msg.Payload.(int)
-		case proxy.EventProxyChecked:
-			payload := msg.Payload.(proxy.EventProxyCheckedPayload)
-			scraped, checked, live, http, s4, s5, _, avg := m.runner.GetStats()
-			m.scrapedCount = scraped
-			m.checkedCount = checked
-			m.liveCount = live
-			m.httpCount = http
-			m.socks4Count = s4
-			m.socks5Count = s5
-			m.avgPing = avg
-
-			if payload.IsLive && payload.Proxy != nil {
-				m.allLive = append(m.allLive, payload.Proxy)
-				m.recentLive = append(m.recentLive, payload.Proxy)
-				if len(m.recentLive) > 4 { // keep last 4 for small screen
-					m.recentLive = m.recentLive[1:]
-				}
-			}
-
-		case proxy.EventCheckingDone:
-			m.checkingDone = true
-			if payload, ok := msg.Payload.([]*proxy.CheckedProxy); ok {
-				m.allLive = payload
-			}
-		}
-
-		if m.runner != nil {
-			return m, listenForEvents(m.runner.EventChan)
-		}
-		return m, nil
-
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c":
-			if m.runner != nil {
-				m.runner.Stop()
-			}
-			if m.cancelFunc != nil {
-				m.cancelFunc()
-			}
-			return m, tea.Quit
+		switch m.state {
+		case stateMenu: return m.updateMenu(msg)
+		case stateScanning: return m.updateScanning(msg)
+		case stateDone: return m.updateDone(msg)
 		}
-
-		switch m.screen {
-		case ScreenWelcome:
-			return m.updateWelcome(msg)
-		case ScreenChecking:
-			return m.updateChecking(msg)
-		case ScreenExport:
-			return m.updateExport(msg)
-		}
+	case tea.WindowSizeMsg: m.width, m.height = msg.Width, msg.Height
+	case proxy.RunnerEvent: return m.handleEvent(msg)
 	}
-
 	return m, nil
 }
 
-func (m *Model) startChecker() tea.Cmd {
-	m.screen = ScreenChecking
-	m.scrapedCount = 0
-	m.checkedCount = 0
-	m.liveCount = 0
-	m.httpCount = 0
-	m.socks4Count = 0
-	m.socks5Count = 0
-	m.avgPing = 0
-	m.scrapingDone = false
-	m.checkingDone = false
-	m.recentLive = nil
-	m.allLive = nil
+func (m *model) updateMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up","k": if m.menuCursor > 0 { m.menuCursor-- }
+	case "down","j": if m.menuCursor < 3 { m.menuCursor++ }
+	case "enter":
+		switch m.menuCursor {
+		case 0: return m.startScan()
+		case 1: m.cfg.CheckModels = false; return m.startScan()
+		case 2: m.logLines = append(m.logLines, "Edit config.yaml to add sources"); m.menuCursor = 0
+		case 3: return m, tea.Quit
+		}
+	case "q","ctrl+c": return m, tea.Quit
+	}
+	return m, nil
+}
 
-	m.runner = proxy.NewRunner(m.config)
-	m.ctx, m.cancelFunc = context.WithCancel(context.Background())
+func (m *model) startScan() (tea.Model, tea.Cmd) {
+	m.state = stateScanning; m.results = nil; m.scanned, m.alive, m.totalModels = 0, 0, 0
+	m.errors, m.logLines = nil, nil
+	m.ctx, m.cancel = context.WithCancel(context.Background())
+	m.runner = proxy.NewRunner(m.cfg)
 	m.runner.Start(m.ctx)
-
-	return listenForEvents(m.runner.EventChan)
+	return m, waitForEvent(m.runner.EventChan)
 }
 
-func (m Model) updateWelcome(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *model) updateScanning(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "up":
-		if m.welcomeIdx > 0 {
-			m.welcomeIdx--
-		}
-	case "down":
-		if m.welcomeIdx < 2 {
-			m.welcomeIdx++
-		}
-	case "enter":
-		switch m.welcomeIdx {
-		case 0: // Start
-			return m, m.startChecker()
-		case 1: // Toggle Settings
-			m.showConfig = !m.showConfig
-		case 2: // Exit
-			return m, tea.Quit
-		}
-	case "q", "esc":
-		return m, tea.Quit
+	case " ": if m.runner.IsPaused() { m.runner.Resume() } else { m.runner.Pause() }
+	case "esc","q": m.runner.Stop(); m.state = stateDone
+	}
+	return m, waitForEvent(m.runner.EventChan)
+}
+
+func (m *model) updateDone(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y": proxy.ExportResults(m.results, m.cfg.ExportPath)
+	case "h": proxy.ExportHermesFormat(m.results, "exports/hermes_providers.yaml")
+	case "enter","r": m.state = stateMenu; m.menuCursor = 0
+	case "q","ctrl+c": return m, tea.Quit
 	}
 	return m, nil
 }
 
-func (m Model) updateChecking(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case " ": // Pause / Resume
-		if m.runner != nil {
-			if m.runner.IsPaused() {
-				m.runner.Resume()
-			} else {
-				m.runner.Pause()
-			}
+func (m *model) handleEvent(event proxy.RunnerEvent) (tea.Model, tea.Cmd) {
+	switch event.Type {
+	case proxy.EventScanStart: m.logLines = append(m.logLines, fmt.Sprintf("Found %d endpoints", event.Payload.(int)))
+	case proxy.EventProxyChecked:
+		payload := event.Payload.(proxy.ProxyCheckedPayload)
+		m.scanned++; m.lastResult = payload.Result
+		if payload.Result.Alive {
+			m.alive++; m.totalModels += payload.Result.ModelsCount; m.results = append(m.results, payload.Result)
+			unlim := ""
+			if payload.Result.Unlimited { unlim = " [UNLIMITED]" }
+			m.logLines = append(m.logLines, fmt.Sprintf("OK %s (%d models%s)", payload.Result.URL, payload.Result.ModelsCount, unlim))
 		}
-	case "enter":
-		if m.checkingDone {
-			m.screen = ScreenExport
-			m.exportIdx = 7 // focus export button directly
+	case proxy.EventScanDone:
+		if m.alive > 0 {
+			var total time.Duration
+			for _, r := range m.results { total += r.Latency }
+			m.avgLatency = total / time.Duration(m.alive)
 		}
-	case "esc":
-		if m.runner != nil {
-			m.runner.Stop()
-		}
-		if m.cancelFunc != nil {
-			m.cancelFunc()
-		}
-		m.checkingDone = true
-		m.screen = ScreenExport
-		m.exportIdx = 7
-	case "q":
-		if m.runner != nil {
-			m.runner.Stop()
-		}
-		if m.cancelFunc != nil {
-			m.cancelFunc()
-		}
-		return m, tea.Quit
+		m.state = stateDone; return m, nil
+	case proxy.EventError: m.logLines = append(m.logLines, fmt.Sprintf("ERR %v", event.Payload))
 	}
-	return m, nil
+	return m, waitForEvent(m.runner.EventChan)
 }
 
-func (m Model) updateExport(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	var cmd tea.Cmd
-
-	// If typing in a field, send keys to it
-	if m.focusedField != 0 {
-		switch msg.String() {
-		case "enter":
-			// Save and return to form navigation
-			m.focusedField = 0
-			m.filterCC.Blur()
-			m.filterPing.Blur()
-			m.exportPath.Blur()
-			return m, nil
-		case "esc":
-			// Cancel and return to form navigation
-			m.focusedField = 0
-			m.filterCC.Blur()
-			m.filterPing.Blur()
-			m.exportPath.Blur()
-			return m, nil
-		default:
-			switch m.focusedField {
-			case 3:
-				m.filterCC, cmd = m.filterCC.Update(msg)
-				return m, cmd
-			case 4:
-				m.filterPing, cmd = m.filterPing.Update(msg)
-				return m, cmd
-			case 6:
-				m.exportPath, cmd = m.exportPath.Update(msg)
-				return m, cmd
-			}
-		}
-	}
-
-	// Normal form item navigation
-	switch msg.String() {
-	case "up":
-		if m.exportIdx > 0 {
-			m.exportIdx--
-		}
-	case "down":
-		if m.exportIdx < 8 {
-			m.exportIdx++
-		}
-	case "left":
-		if m.exportIdx == 5 { // Format selector
-			if m.exportFormat > 0 {
-				m.exportFormat--
-			}
-		}
-	case "right":
-		if m.exportIdx == 5 { // Format selector
-			if m.exportFormat < 4 {
-				m.exportFormat++
-			}
-		}
-	case "enter", " ":
-		m.exportMsg = "" // Clear message when navigating
-		switch m.exportIdx {
-		case 0:
-			m.filterHTTP = !m.filterHTTP
-		case 1:
-			m.filterSocks4 = !m.filterSocks4
-		case 2:
-			m.filterSocks5 = !m.filterSocks5
-		case 3: // Edit CC
-			m.focusedField = 3
-			m.filterCC.Focus()
-		case 4: // Edit Ping
-			m.focusedField = 4
-			m.filterPing.Focus()
-		case 5: // Cycle format on enter as well
-			if msg.String() == "enter" {
-				m.exportFormat = (m.exportFormat + 1) % 5
-			}
-		case 6: // Edit Path
-			m.focusedField = 6
-			m.exportPath.Focus()
-		case 7: // Export Button
-			m.triggerExport()
-		case 8: // Back Button
-			m.screen = ScreenWelcome
-		}
-	case "esc":
-		m.screen = ScreenWelcome
-	case "q":
-		return m, tea.Quit
-	}
-
-	return m, nil
+func waitForEvent(ch <-chan proxy.RunnerEvent) tea.Cmd {
+	return func() tea.Msg { event, ok := <-ch; if !ok { return nil }; return event }
 }
 
-func (m *Model) triggerExport() {
-	m.exportMsg = ""
-	m.exportErr = false
+func (m *model) View() string {
+	switch m.state {
+	case stateMenu: return m.viewMenu()
+	case stateScanning: return m.viewScanning()
+	case stateDone: return m.viewDone()
+	}
+	return ""
+}
 
-	ccFilter := strings.TrimSpace(strings.ToUpper(m.filterCC.Value()))
-	var countries []string
-	if ccFilter != "" {
-		parts := strings.Split(ccFilter, ",")
-		for _, p := range parts {
-			countries = append(countries, strings.TrimSpace(p))
-		}
+func (m *model) viewMenu() string {
+	title := titleStyle.Render("APOXY - API Proxy Scanner")
+	subtitle := subtitleStyle.Render("Finds OpenAI-compatible API endpoints")
+	items := []string{"Full Scan (check models)", "Quick Scan (health only)", "Add Sources (config.yaml)", "Quit"}
+	var menu strings.Builder
+	for i, item := range items {
+		if i == m.menuCursor { menu.WriteString(selectedStyle.Render("> "+item)+"\n") } else { menu.WriteString("  "+item+"\n") }
 	}
+	info := fmt.Sprintf("Sources: %d | Threads: %d | Timeout: %v", len(m.cfg.Sources), m.cfg.Threads, m.cfg.Timeout)
+	return lipgloss.JoinVertical(lipgloss.Center, title, subtitle, "", menu.String(), "", dimStyle.Render(info), "", dimStyle.Render("nav / Enter / Q"))
+}
 
-	pingLimit := time.Duration(0)
-	pingVal := strings.TrimSpace(m.filterPing.Value())
-	if pingVal != "" {
-		if !strings.HasSuffix(pingVal, "ms") && !strings.HasSuffix(pingVal, "s") {
-			pingVal += "ms"
-		}
-		if d, err := time.ParseDuration(pingVal); err == nil {
-			pingLimit = d
-		}
+func (m *model) viewScanning() string {
+	status := "Scanning..."
+	if m.runner != nil && m.runner.IsPaused() { status = "PAUSED" }
+	stats := fmt.Sprintf("Scanned: %d | Alive: %d | Models: %d", m.scanned, m.alive, m.totalModels)
+	var last string
+	if m.lastResult != nil {
+		if m.lastResult.Alive { last = fmt.Sprintf("Last: OK %s (%v)", m.lastResult.URL, m.lastResult.Latency.Round(time.Millisecond)) } else { last = fmt.Sprintf("Last: FAIL %s", m.lastResult.URL) }
 	}
+	var log strings.Builder
+	start := 0
+	if len(m.logLines) > 15 { start = len(m.logLines) - 15 }
+	for _, l := range m.logLines[start:] { log.WriteString(dimStyle.Render(l)+"\n") }
+	return lipgloss.JoinVertical(lipgloss.Left, titleStyle.Render(status), subtitleStyle.Render(stats), "", last, "", log.String(), "", dimStyle.Render("Space=Pause Esc=Stop"))
+}
 
-	filter := proxy.ExportFilter{
-		Protocols: nil,
-		MaxPing:   pingLimit,
-		Countries: countries,
+func (m *model) viewDone() string {
+	status := fmt.Sprintf("DONE - %d alive / %d scanned", m.alive, m.scanned)
+	stats := fmt.Sprintf("Models: %d | Avg latency: %v", m.totalModels, m.avgLatency)
+	var res strings.Builder
+	for i, r := range m.results {
+		if i >= 20 { res.WriteString(fmt.Sprintf("  ... +%d more\n", len(m.results)-20)); break }
+		unlim := ""
+		if r.Unlimited { unlim = " UNLIMITED" }
+		res.WriteString(fmt.Sprintf("  %d. %s | %v | %d models%s\n", i+1, r.URL, r.Latency.Round(time.Millisecond), r.ModelsCount, unlim))
 	}
-	if m.filterHTTP {
-		filter.Protocols = append(filter.Protocols, "http")
-	}
-	if m.filterSocks4 {
-		filter.Protocols = append(filter.Protocols, "socks4")
-	}
-	if m.filterSocks5 {
-		filter.Protocols = append(filter.Protocols, "socks5")
-	}
-
-	if len(filter.Protocols) == 0 {
-		m.exportMsg = "Error: Select at least one proxy protocol!"
-		m.exportErr = true
-		return
-	}
-
-	formats := []string{"raw", "uri", "pretty", "csv", "json"}
-	fmtName := formats[m.exportFormat]
-
-	path := strings.TrimSpace(m.exportPath.Value())
-	if path == "" {
-		m.exportMsg = "Error: File path cannot be empty!"
-		m.exportErr = true
-		return
-	}
-
-	count, err := proxy.Export(m.allLive, filter, fmtName, path)
-	if err != nil {
-		m.exportMsg = fmt.Sprintf("Error: %v", err)
-		m.exportErr = true
-	} else {
-		m.exportMsg = fmt.Sprintf("Success! Exported %d proxies to %s", count, path)
-		m.exportErr = false
-	}
+	return lipgloss.JoinVertical(lipgloss.Left, titleStyle.Render(status), subtitleStyle.Render(stats), "", res.String(), "", dimStyle.Render("Y=JSON H=Hermes R=Rescan Q=Quit"))
 }
