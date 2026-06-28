@@ -1,22 +1,19 @@
 package proxy
 
 import (
+	"apoxy/config"
 	"context"
-	"fmt"
-	"minoxy/config"
 	"sync"
 	"time"
 )
 
 type EventType int
-
 const (
-	EventScrapingSource EventType = iota
-	EventSourceScraped
-	EventScrapingDone
+	EventScanStart EventType = iota
+	EventSourceDone
 	EventProxyChecked
-	EventCheckingDone
-	EventScrapeError
+	EventScanDone
+	EventError
 )
 
 type RunnerEvent struct {
@@ -24,264 +21,83 @@ type RunnerEvent struct {
 	Payload interface{}
 }
 
-type EventSourceScrapedPayload struct {
-	Source string
-	Count  int
-}
-
-type EventProxyCheckedPayload struct {
-	Proxy  *CheckedProxy
-	IsLive bool
-}
+type SourceDonePayload struct{ Source string; Endpoints int }
+type ProxyCheckedPayload struct{ Result *APIProxyResult }
 
 type Runner struct {
-	mu           sync.Mutex
-	Config       *config.Config
-	LiveProxies  []*CheckedProxy
-	allRaw       []RawProxy
-	rawIdx       int
-	
-	// Stats
-	ScrapedCount int
-	CheckedCount int
-	LiveCount    int
-	HTTPCount    int
-	Socks4Count  int
-	Socks5Count  int
-	TotalPing    time.Duration
-
-	// Control flow
-	isPaused   bool
-	isStopped  bool
-	cond       *sync.Cond
-	cancelFunc context.CancelFunc
-	wg         sync.WaitGroup
-
-	EventChan chan RunnerEvent
+	mu          sync.Mutex
+	Config      *config.Config
+	Results     []*APIProxyResult
+	ScannedCount, AliveCount, TotalModels int
+	TotalLatency time.Duration
+	isPaused, isStopped bool
+	cond        *sync.Cond
+	cancelFn    context.CancelFunc
+	wg          sync.WaitGroup
+	EventChan   chan RunnerEvent
 }
 
 func NewRunner(cfg *config.Config) *Runner {
-	r := &Runner{
-		Config:    cfg,
-		EventChan: make(chan RunnerEvent, 100),
-	}
+	r := &Runner{Config: cfg, EventChan: make(chan RunnerEvent, 200)}
 	r.cond = sync.NewCond(&r.mu)
 	return r
 }
 
 func (r *Runner) Start(ctx context.Context) {
 	cctx, cancel := context.WithCancel(ctx)
-	r.cancelFunc = cancel
-
+	r.cancelFn = cancel
 	go r.run(cctx)
 }
 
-func (r *Runner) Pause() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.isPaused = true
-}
-
-func (r *Runner) Resume() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.isPaused = false
-	r.cond.Broadcast()
-}
-
-func (r *Runner) Stop() {
-	r.mu.Lock()
-	r.isStopped = true
-	r.isPaused = false
-	r.cond.Broadcast()
-	r.mu.Unlock()
-
-	if r.cancelFunc != nil {
-		r.cancelFunc()
-	}
-}
-
-func (r *Runner) IsPaused() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.isPaused
-}
+func (r *Runner) Pause()  { r.mu.Lock(); r.isPaused = true; r.mu.Unlock() }
+func (r *Runner) Resume() { r.mu.Lock(); r.isPaused = false; r.cond.Broadcast(); r.mu.Unlock() }
+func (r *Runner) Stop()   { r.mu.Lock(); r.isStopped = true; r.isPaused = false; r.cond.Broadcast(); r.mu.Unlock(); if r.cancelFn != nil { r.cancelFn() } }
+func (r *Runner) IsPaused() bool { r.mu.Lock(); defer r.mu.Unlock(); return r.isPaused }
 
 func (r *Runner) run(ctx context.Context) {
 	defer close(r.EventChan)
-
-	// Step 1: Scrape all sources concurrently
-	var wgScrape sync.WaitGroup
-	var muScrape sync.Mutex
-	var rawList []RawProxy
-	seen := make(map[string]bool)
-
-	for _, src := range r.Config.Sources {
-		wgScrape.Add(1)
-		go func(url string) {
-			defer wgScrape.Done()
-
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-
-			r.EventChan <- RunnerEvent{
-				Type:    EventScrapingSource,
-				Payload: url,
-			}
-
-			// Use a 10s context timeout for each source fetch
-			sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			defer cancel()
-
-			scraped, err := ScrapeURL(sctx, url)
-			if err != nil {
-				r.EventChan <- RunnerEvent{
-					Type:    EventScrapeError,
-					Payload: fmt.Sprintf("Error %s: %v", url, err),
-				}
-				return
-			}
-
-			muScrape.Lock()
-			count := 0
-			for _, proxy := range scraped {
-				if !seen[proxy.IPPort] {
-					seen[proxy.IPPort] = true
-					rawList = append(rawList, proxy)
-					count++
-				}
-			}
-			r.ScrapedCount = len(rawList)
-			muScrape.Unlock()
-
-			r.EventChan <- RunnerEvent{
-				Type: EventSourceScraped,
-				Payload: EventSourceScrapedPayload{
-					Source: url,
-					Count:  count,
-				},
-			}
-		}(src)
-	}
-
-	wgScrape.Wait()
-
-	r.mu.Lock()
-	r.allRaw = rawList
-	r.mu.Unlock()
-
-	r.EventChan <- RunnerEvent{
-		Type:    EventScrapingDone,
-		Payload: len(rawList),
-	}
-
-	if len(rawList) == 0 {
-		r.EventChan <- RunnerEvent{
-			Type:    EventCheckingDone,
-			Payload: nil,
-		}
+	sources := append(r.Config.Sources, AddBuiltinSources()...)
+	endpoints, _ := ScrapeAPISources(ctx, sources)
+	r.EventChan <- RunnerEvent{Type: EventScanStart, Payload: len(endpoints)}
+	if len(endpoints) == 0 {
+		r.EventChan <- RunnerEvent{Type: EventScanDone, Payload: r.Results}
 		return
 	}
-
-	// Step 2: Concurrently check all proxies
-	jobsChan := make(chan RawProxy, len(rawList))
-	for _, p := range rawList {
-		jobsChan <- p
-	}
-	close(jobsChan)
-
+	jobs := make(chan RawAPIEndpoint, len(endpoints))
+	for _, ep := range endpoints { jobs <- ep }
+	close(jobs)
 	threads := r.Config.Threads
-	if threads > len(rawList) {
-		threads = len(rawList)
-	}
-
-	for i := 0; i < threads; i++ {
-		r.wg.Add(1)
-		go r.worker(ctx, jobsChan)
-	}
-
+	if threads > len(endpoints) { threads = len(endpoints) }
+	for i := 0; i < threads; i++ { r.wg.Add(1); go r.worker(ctx, jobs) }
 	r.wg.Wait()
-
-	r.EventChan <- RunnerEvent{
-		Type:    EventCheckingDone,
-		Payload: r.LiveProxies,
-	}
+	r.EventChan <- RunnerEvent{Type: EventScanDone, Payload: r.Results}
 }
 
-func (r *Runner) worker(ctx context.Context, jobs <-chan RawProxy) {
+func (r *Runner) worker(ctx context.Context, jobs <-chan RawAPIEndpoint) {
 	defer r.wg.Done()
-
 	for {
 		select {
-		case <-ctx.Done():
-			return
+		case <-ctx.Done(): return
 		default:
 		}
-
-		// Handle pause/stop controls
 		r.mu.Lock()
-		if r.isStopped {
-			r.mu.Unlock()
-			return
-		}
-		for r.isPaused && !r.isStopped {
-			r.cond.Wait()
-		}
-		if r.isStopped {
-			r.mu.Unlock()
-			return
-		}
+		if r.isStopped { r.mu.Unlock(); return }
+		for r.isPaused && !r.isStopped { r.cond.Wait() }
 		r.mu.Unlock()
-
-		raw, ok := <-jobs
-		if !ok {
-			return
-		}
-
-		// Perform check
-		checked, err := CheckProxy(ctx, raw, r.Config.CheckURL, r.Config.Timeout, r.Config.Protocols)
-
+		ep, ok := <-jobs
+		if !ok { return }
+		result := CheckAPIProxy(ctx, ep.URL, r.Config.Timeout, r.Config.CheckModels)
 		r.mu.Lock()
-		r.CheckedCount++
-		isLive := err == nil
-		if isLive && checked != nil {
-			r.LiveCount++
-			r.TotalPing += checked.Ping
-			r.LiveProxies = append(r.LiveProxies, checked)
-
-			switch checked.Protocol {
-			case "http":
-				r.HTTPCount++
-			case "socks4":
-				r.Socks4Count++
-			case "socks5":
-				r.Socks5Count++
-			}
-		}
+		r.ScannedCount++
+		if result.Alive { r.AliveCount++; r.TotalLatency += result.Latency; r.TotalModels += result.ModelsCount; r.Results = append(r.Results, result) }
 		r.mu.Unlock()
-
-		// Send event
-		r.EventChan <- RunnerEvent{
-			Type: EventProxyChecked,
-			Payload: EventProxyCheckedPayload{
-				Proxy:  checked,
-				IsLive: isLive,
-			},
-		}
+		r.EventChan <- RunnerEvent{Type: EventProxyChecked, Payload: ProxyCheckedPayload{Result: result}}
 	}
 }
 
-func (r *Runner) GetStats() (scraped, checked, live, http, s4, s5, dead int, avgPing time.Duration) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
+func (r *Runner) GetStats() (scanned, alive, totalModels int, avgLatency time.Duration) {
+	r.mu.Lock(); defer r.mu.Unlock()
 	avg := time.Duration(0)
-	if r.LiveCount > 0 {
-		avg = r.TotalPing / time.Duration(r.LiveCount)
-	}
-
-	return r.ScrapedCount, r.CheckedCount, r.LiveCount, r.HTTPCount, r.Socks4Count, r.Socks5Count, r.CheckedCount - r.LiveCount, avg
+	if r.AliveCount > 0 { avg = r.TotalLatency / time.Duration(r.AliveCount) }
+	return r.ScannedCount, r.AliveCount, r.TotalModels, avg
 }
