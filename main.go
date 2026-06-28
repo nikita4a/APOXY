@@ -1,9 +1,10 @@
 package main
 
 import (
+	"apoxy/config"
+	"apoxy/proxy"
+	"apoxy/tui"
 	"fmt"
-	"minoxy/config"
-	"minoxy/tui"
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -11,22 +12,16 @@ import (
 
 func main() {
 	configPath := "config.yaml"
-
-	// Load configuration from config.yaml
 	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
-		fmt.Printf("Error loading config: %v\n", err)
+		fmt.Printf("Error loading config: %v
+", err)
 		os.Exit(1)
 	}
-
-	// Start the interactive TUI directly using the configuration
-	runTUI(cfg, configPath)
-}
-
-func runTUI(cfg *config.Config, configPath string) {
 	p := tea.NewProgram(tui.NewModel(cfg, configPath), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
-		fmt.Printf("Error running TUI: %v\n", err)
+		fmt.Printf("Error: %v
+", err)
 		os.Exit(1)
 	}
 }
